@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>TETRIS — Pure HTML5</title>
+<style>
+  :root{--bg:#0b0f14;--panel:#151b23;--grid:#0e141b;--cell:#1c2530;--text:#e6edf3;--accent:#3aa6ff;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  #wrap{display:flex;justify-content:center;align-items:center;height:100%;padding:8px;box-sizing:border-box;gap:12px}
+  canvas{background:var(--grid);display:block;border-radius:8px}
+  #ui{width:220px;display:flex;flex-direction:column;gap:10px}
+  .panel{background:var(--panel);border-radius:10px;padding:10px}
+  .row{display:flex;gap:8px}
+  .stat{font-size:14px;line-height:1.2}
+  .title{font-weight:700;margin-bottom:6px}
+  #mobile{position:fixed;left:0;right:0;bottom:8px;display:flex;justify-content:center;gap:10px;pointer-events:none}
+  .btn{pointer-events:auto;width:64px;height:64px;border-radius:50%;background:#ffffff18;border:2px solid #ffffff66;color:#fff;
+       display:flex;align-items:center;justify-content:center;font-size:22px;user-select:none;touch-action:none}
+  .btn:active{background:#ffffff30}
+  @media (max-width:900px){ #wrap{flex-direction:column} #ui{order:-1; width:min(420px,92vw);} }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="320" height="640"></canvas>
+  <div id="ui">
+    <div class="panel">
+      <div class="title">Очки / Уровень</div>
+      <div class="stat">Очки: <span id="score">0</span></div>
+      <div class="stat">Линии: <span id="lines">0</span></div>
+      <div class="stat">Уровень: <span id="level">1</span></div>
+    </div>
+    <div class="row">
+      <canvas id="hold" width="96" height="96" class="panel"></canvas>
+      <canvas id="next" width="96" height="192" class="panel"></canvas>
+    </div>
+    <div class="panel stat">
+      Управление: ← → — движение, ↑ — вращение, ↓ — ускорить, <b>Space</b> — жёсткая посадка, <b>Shift</b> — Hold, <b>P</b> — пауза.
+    </div>
+  </div>
+</div>
+
+<!-- Мобильные кнопки -->
+<div id="mobile">
+  <div class="btn" id="btnLeft">◀</div>
+  <div class="btn" id="btnRight">▶</div>
+  <div class="btn" id="btnRotate">⟳</div>
+  <div class="btn" id="btnDown">⬇</div>
+  <div class="btn" id="btnDrop">⤓</div>
+  <div class="btn" id="btnHold">H</div>
+  <div class="btn" id="btnPause">Ʌ</div>
+</div>
+
+<script>
+(function(){
+  // ---- Константы поля ----
+  const COLS=10, ROWS=20, SZ=32;
+  const W=COLS*SZ, H=ROWS*SZ;
+  const canvas=document.getElementById('game'), ctx=canvas.getContext('2d');
+  const holdCV=document.getElementById('hold'), hctx=holdCV.getContext('2d');
+  const nextCV=document.getElementById('next'), nctx=nextCV.getContext('2d');
+  // UI
+  const scoreEl=id('score'), linesEl=id('lines'), levelEl=id('level');
+  function id(x){return document.getElementById(x)}
+
+  // Масштаб под экран
+  function fit(){
+    const wrap = document.getElementById('wrap');
+    const r = Math.min((window.innerHeight-160)/H, (window.innerWidth-260)/W);
+    const k = Math.max(0.6, Math.min(1.0, r));
+    canvas.style.width = (W*k)+'px'; canvas.style.height=(H*k)+'px';
+  } window.addEventListener('resize',fit); fit();
+
+  // ---- Фигуры (матрицы) + цвета ----
+  const TETROS = {
+    I:[[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]],
+    J:[[1,0,0],[1,1,1],[0,0,0]],
+    L:[[0,0,1],[1,1,1],[0,0,0]],
+    O:[[1,1],[1,1]],
+    S:[[0,1,1],[1,1,0],[0,0,0]],
+    T:[[0,1,0],[1,1,1],[0,0,0]],
+    Z:[[1,1,0],[0,1,1],[0,0,0]],
+  };
+  const COLORS = {
+    I:'#3bdfff', J:'#4b7cff', L:'#ff914b', O:'#ffd93b', S:'#44e07a', T:'#b76bff', Z:'#ff5e6c', GHOST:'#ffffff40'
+  };
+  const KEYS = {left:false,right:false,down:false,rot:false,drop:false,hold:false,pause:false};
+
+  // ---- Игровое состояние ----
+  let board = createMatrix(ROWS,COLS,0);
+  let bag = [], queue = [];
+  let piece = null, hold = null, canHold = true;
+  let score=0, lines=0, level=1;
+  let dropInterval = 1000, lastDrop=0, paused=false, gameOver=false;
+
+  // ---- Утилиты ----
+  function createMatrix(r,c,val=0){return Array.from({length:r},()=>Array(c).fill(val))}
+  function cloneM(m){return m.map(row=>row.slice())}
+  function rotateM(m){ // SRS-поворот (право)
+    const N=m.length, res=createMatrix(N,N,0);
+    for(let y=0;y<N;y++) for(let x=0;x<N;x++) res[x][N-1-y]=m[y][x];
+    return res;
+  }
+  function forEachCell(mat, fn){
+    for(let y=0;y<mat.length;y++) for(let x=0;x<mat[y].length;x++) if(mat[y][x]) fn(x,y);
+  }
+  function newPiece(){
+    if (queue.length<5) refillBag();
+    const t = queue.shift();
+    const mat = cloneM(TETROS[t]);
+    let x = Math.floor(COLS/2) - Math.ceil(mat[0].length/2);
+    let y = -getTopOffset(mat);
+    return {type:t, m:mat, x, y, r:0, color:COLORS[t]};
+  }
+  function getTopOffset(m){
+    for(let y=0;y<m.length;y++) if(m[y].some(v=>v)) return y; return 0;
+  }
+  function refillBag(){
+    if (bag.length===0){ bag = Object.keys(TETROS); shuffle(bag); }
+    queue.push(...bag.splice(0,7));
+  }
+  function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]] } }
+
+  // ---- Коллизии ----
+  function collides(p, mat=p.m, ox=0, oy=0){
+    let x,y;
+    forEachCell(mat,(cx,cy)=>{
+      x = p.x+ox+cx; y = p.y+oy+cy;
+      if (y>=ROWS || x<0 || x>=COLS || (y>=0 && board[y][x])) { x=-999; } // flag hit
+    });
+    return x===-999;
+  }
+
+  // ---- Посадка и чистка линий ----
+  function merge(p){
+    forEachCell(p.m,(cx,cy)=>{
+      const x=p.x+cx, y=p.y+cy;
+      if (y>=0) board[y][x]=p.color;
+      else { gameOver = true; paused=false; }
+    });
+  }
+  function clearLines(){
+    let cleared=0;
+    for(let y=ROWS-1;y>=0;y--){
+      if(board[y].every(v=>v)){
+        board.splice(y,1);
+        board.unshift(Array(COLS).fill(0));
+        cleared++; y++;
+      }
+    }
+    if (cleared){
+      lines += cleared;
+      const base=[0,100,300,500,800][cleared];
+      score += base*(level);
+      level = 1 + Math.floor(lines/10);
+      dropInterval = Math.max(70, 1000 - (level-1)*70);
+      updateHUD();
+    }
+  }
+
+  // ---- Призрак ----
+  function ghostY(p){
+    let gy=p.y;
+    while(!collides(p,p.m,0,gy-p.y+1)) gy++;
+    return gy;
+  }
+
+  // ---- Рендер ----
+  function drawCell(x,y,color,ctx2=ctx, size=SZ){
+    const px=x*size, py=y*size;
+    // тело
+    ctx2.fillStyle=color; ctx2.fillRect(px+1,py+1,size-2,size-2);
+    // блик/тень
+    ctx2.fillStyle='#ffffff18'; ctx2.fillRect(px+1,py+1,size-2,Math.max(2, size*0.18));
+    ctx2.fillStyle='#00000025'; ctx2.fillRect(px+1,py+size*0.8,size-2,Math.max(2,size*0.2)-1);
+  }
+  function render(){
+    // поле
+    ctx.clearRect(0,0,W,H);
+    for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++){
+      const c = board[y][x] || ( (x+y)%2 ? '#10161d' : '#0d131a' );
+      drawCell(x,y,c);
+    }
+    if (piece){
+      // призрак
+      const gY = ghostY(piece);
+      forEachCell(piece.m,(cx,cy)=>{ const x=piece.x+cx, y=gY+cy; if(y>=0) drawCell(x,y,COLORS.GHOST) });
+      // активная фигура
+      forEachCell(piece.m,(cx,cy)=>{ const x=piece.x+cx, y=piece.y+cy; if(y>=0) drawCell(x,y,piece.color) });
+    }
+    // если конец
+    if (gameOver){
+      overlayText('ИГРА ОКОНЧЕНА', 'Space — ещё раз');
+    } else if (paused){
+      overlayText('ПАУЗА', 'P — продолжить');
+    }
+    // Hold/Next
+    drawMini(hctx, holdCV, hold, true);
+    drawQueue(nctx, nextCV, queue.slice(0,3));
+  }
+  function overlayText(t1,t2){
+    ctx.fillStyle='#000000aa'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff'; ctx.font='bold 26px system-ui'; ctx.textAlign='center';
+    ctx.fillText(t1, W/2, H/2-10);
+    ctx.font='16px system-ui'; ctx.fillStyle='#d0d7de';
+    ctx.fillText(t2, W/2, H/2+20);
+  }
+  function drawMini(c,cv,shapeOrNull,isHold=false){
+    c.clearRect(0,0,cv.width,cv.height);
+    c.fillStyle='#0e141b'; c.fillRect(0,0,cv.width,cv.height);
+    if(!shapeOrNull){ c.fillStyle='#8899aa'; c.font='12px system-ui'; c.fillText(isHold?'HOLD':'NEXT',8,14); return; }
+    const mat = TETROS[shapeOrNull];
+    const size = 20, offx = (cv.width - mat[0].length*size)/2, offy=(cv.height - mat.length*size)/2;
+    forEachCell(mat,(x,y)=> drawCell(x+offx/size, y+offy/size, COLORS[shapeOrNull], c, size));
+  }
+  function drawQueue(c,cv,arr){
+    c.clearRect(0,0,cv.width,cv.height);
+    c.fillStyle='#0e141b'; c.fillRect(0,0,cv.width,cv.height);
+    const size=18;
+    arr.forEach((t,idx)=>{
+      const mat=TETROS[t]; const offx=(cv.width-mat[0].length*size)/2; const offy=8 + idx*60;
+      forEachCell(mat,(x,y)=> drawCell(x+offx/size, y+(offy/size), COLORS[t], c, size));
+    });
+  }
+
+  // ---- Движение/вращение ----
+  function tryMove(dx,dy){
+    if(!piece || paused || gameOver) return false;
+    if(!collides(piece, piece.m, dx, dy)){ piece.x+=dx; piece.y+=dy; return true; }
+    return false;
+  }
+  function hardDrop(){
+    if(!piece || paused || gameOver) return;
+    let cells=0;
+    while(tryMove(0,1)) cells++;
+    score += cells*2;
+    lockPiece();
+  }
+  function softDrop(){
+    if(tryMove(0,1)) score += 1;
+    else lockPiece();
+  }
+  const KICKS = {
+    'I': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
+    'N': [[0,0],[-1,0],[1,0],[0,-1],[0,1]]
+  };
+  function rotate(){
+    if(!piece || paused || gameOver) return;
+    const m = rotateM(piece.m);
+    const kicks = (piece.type==='I')?KICKS.I:KICKS.N;
+    for(const [kx,ky] of kicks){
+      if(!collides(piece,m,kx,ky)){ piece.m=m; piece.x+=kx; piece.y+=ky; return; }
+    }
+  }
+  function lockPiece(){
+    merge(piece);
+    clearLines();
+    piece = newPiece();
+    canHold = true;
+    if (collides(piece)) { gameOver=true; }
+    updateHUD();
+  }
+  function doHold(){
+    if(!piece || !canHold || paused || gameOver) return;
+    const curType = piece.type;
+    if (hold===null){ hold=curType; piece=newPiece(); }
+    else { [hold, piece] = [curType, spawnFrom(hold)]; }
+    canHold=false; render();
+  }
+  function spawnFrom(type){
+    const mat=cloneM(TETROS[type]);
+    let x=Math.floor(COLS/2)-Math.ceil(mat[0].length/2);
+    let y=-getTopOffset(mat);
+    return {type, m:mat, x, y, r:0, color:COLORS[type]};
+  }
+
+  // ---- Цикл ----
+  piece = newPiece(); updateHUD(); render();
+  let last=performance.now();
+  function loop(){
+    const now = performance.now();
+    const dt = now - last; last = now;
+    if(!paused && !gameOver){
+      lastDrop += dt;
+      if (lastDrop >= dropInterval){ lastDrop=0; softDrop(); }
+    }
+    render();
+    requestAnimationFrame(loop);
+  } requestAnimationFrame(loop);
+
+  function updateHUD(){
+    scoreEl.textContent=score|0; linesEl.textContent=lines|0; levelEl.textContent=level|0;
+  }
+
+  // ---- Ввод: клавиатура ----
+  addEventListener('keydown',e=>{
+    if(e.repeat) return;
+    if(e.code==='ArrowLeft'){ tryMove(-1,0); }
+    else if(e.code==='ArrowRight'){ tryMove(1,0); }
+    else if(e.code==='ArrowUp'){ rotate(); }
+    else if(e.code==='ArrowDown'){ softDrop(); }
+    else if(e.code==='Space'){ hardDrop(); e.preventDefault(); }
+    else if(e.code==='ShiftLeft' || e.code==='ShiftRight'){ doHold(); }
+    else if(e.key==='p' || e.key==='P'){ paused=!paused; }
+  });
+
+  // ---- Мобильные кнопки ----
+  const press = (el, fn)=>{
+    const d = (ev)=>{ fn(); ev.preventDefault(); };
+    el.addEventListener('touchstart',d,{passive:false});
+    el.addEventListener('mousedown',d);
+  };
+  press(id('btnLeft'), ()=>tryMove(-1,0));
+  press(id('btnRight'),()=>tryMove(1,0));
+  press(id('btnRotate'),()=>rotate());
+  press(id('btnDown'), ()=>softDrop());
+  press(id('btnDrop'), ()=>hardDrop());
+  press(id('btnHold'), ()=>doHold());
+  press(id('btnPause'),()=>paused=!paused);
+
+  // ---- Сброс игры (Space на Game Over) ----
+  addEventListener('keydown',e=>{
+    if(gameOver && e.code==='Space'){
+      board = createMatrix(ROWS,COLS,0);
+      bag=[]; queue=[]; refillBag();
+      score=0; lines=0; level=1; dropInterval=1000; gameOver=false; paused=false; canHold=true; hold=null;
+      piece=newPiece(); updateHUD();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
